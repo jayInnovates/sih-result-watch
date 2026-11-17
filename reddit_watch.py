@@ -35,6 +35,7 @@ if _custom:
     CORE_SUBS, EXTRA_SUBS = [x.strip() for x in _custom.split(",") if x.strip()], []
 SUBREDDITS = CORE_SUBS + EXTRA_SUBS
 FELL_BACK = False
+RSS_GAP = 61  # seconds between RSS requests
 SEARCH_QUERY = '"SIH 2026" OR "SIH result" OR "SIH results" OR "smart india hackathon"'
 
 SIH = re.compile(r"\bSIH\b|smart\s*india\s*hackathon", re.IGNORECASE)
@@ -177,7 +178,7 @@ def rss_feeds(subs: list[str]) -> list[tuple[str, str]]:
     for b_ in busy:
         feeds.append((f"comments:{b_}", f"https://www.reddit.com/r/{b_}/comments/.rss?limit=100"))
     feeds.append(("comments:other", f"https://www.reddit.com/r/{'+'.join(rest)}/comments/.rss?limit=100"))
-    feeds.append(("search", f"https://www.reddit.com/search.rss?q={q}&sort=new&t=week&limit=100"))
+    # (Reddit-wide search.rss returns 403 to GitHub's servers, so it is not used)
     return feeds
 
 
@@ -187,7 +188,7 @@ def get_rss(url: str) -> bytes:
             return http_get(url, {"Accept": "application/atom+xml"})
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < 2:
-                wait = 20 * (attempt + 1)
+                wait = 30 * (attempt + 1)
                 print(f"[reddit:rss] 429, waiting {wait}s")
                 time.sleep(wait)
                 continue
@@ -245,7 +246,8 @@ def fetch_all() -> tuple[list[dict], str, int, int]:
         except Exception as e:  # noqa: BLE001
             print(f"[reddit:rss] error {name}: {e}", file=sys.stderr)
         i += 1
-        time.sleep(8)
+        if i < len(feeds):
+            time.sleep(RSS_GAP)  # Reddit allows ~1 RSS request/minute from GitHub
     print(f"[reddit:rss] {ok}/{len(feeds)} feeds OK, {len(items)} items")
     return (items, "rss", ok, len(feeds)) if ok else ([], "none", 0, len(feeds))
 
@@ -327,7 +329,7 @@ def main() -> int:
         notify(
             "Reddit watcher is running ✅",
             f"Scanning new posts + comments in r/{', r/'.join(SUBREDDITS)} and a Reddit-wide "
-            f"search every ~10 min.\nThis run: {ok}/{total} feeds OK, {len(items)} items.",
+            f"search (when available) every ~10 min.\nThis run: {ok}/{total} feeds OK, {len(items)} items.",
             click="https://www.reddit.com/r/Btechtards/new/",
         )
 
