@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "5-59/10 * * * *"   # every 10 minutes (offset from the other watcher)
   workflow_dispatch:
+    inputs:
+      sample:
+        description: "Send a SAMPLE alert instead of checking Reddit"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,6 +41,7 @@ jobs:
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           REDDIT_SUBS: ${{ vars.REDDIT_SUBS }}
+          SAMPLE: ${{ inputs.sample }}
         run: python -u reddit_watch.py
 
       - name: Save state

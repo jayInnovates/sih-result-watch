@@ -28,8 +28,8 @@ from pathlib import Path
 
 # Subreddits where SIH results get discussed first. CORE = known to exist;
 # EXTRA are tried too, and dropped automatically if Reddit rejects them.
-CORE_SUBS = ["Btechtards", "developersIndia", "Indian_Academia", "hackathon", "india"]
-EXTRA_SUBS = ["hackathons", "IndianStudents", "SmartIndiaHackathon", "NITSilchar", "StudentsofIndia"]
+CORE_SUBS = ["Btechtards"]
+EXTRA_SUBS = ["hackathons", "IndianStudents"]
 _custom = os.environ.get("REDDIT_SUBS", "").strip()
 if _custom:
     CORE_SUBS, EXTRA_SUBS = [x.strip() for x in _custom.split(",") if x.strip()], []
@@ -169,9 +169,8 @@ def oauth_token() -> str | None:
 
 def rss_feeds(subs: list[str]) -> list[tuple[str, str]]:
     multi = "+".join(subs)
-    busy = [x for x in subs if x in ("Btechtards", "developersIndia")]
-    # r/india is far too busy to follow every comment; its posts are still in "posts"
-    rest = [x for x in subs if x not in busy and x != "india"] or subs
+    busy = [x for x in subs if x == "Btechtards"]
+    rest = [x for x in subs if x not in busy] or subs
     q = urllib.parse.quote(SEARCH_QUERY)
     feeds = [("posts", f"https://www.reddit.com/r/{multi}/new/.rss?limit=100")]
     # comments: busy subs get their own feed so 100-item window covers 10 minutes
@@ -264,7 +263,24 @@ def is_hit(it: dict) -> bool:
     return True
 
 
+def send_sample() -> None:
+    notify(
+        "🚨 Reddit: SIH result chatter! [SAMPLE]",
+        "2 new Reddit mentions of SIH results:\n"
+        "• r/Btechtards comment: bro SIH 2026 phase 1 results aa gaye!! check sih.gov.in, "
+        "our team got shortlisted for hardware finale 🔥 [on: SIH 2026 results discussion]\n"
+        "• r/hackathons post: Smart India Hackathon 2026 shortlisted teams list is out "
+        "- grand finale nodal centres announced\n\n"
+        "Verify on sih.gov.in.\n\n(This is a SAMPLE alert - no real results yet.)",
+        urgent=True,
+        click="https://www.reddit.com/r/Btechtards/new/",
+    )
+
+
 def main() -> int:
+    if os.environ.get("SAMPLE", "").lower() == "true":
+        send_sample()
+        return 0
     STATE_DIR.mkdir(exist_ok=True)
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     first = not state.get("announced")
