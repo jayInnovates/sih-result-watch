@@ -1,0 +1,58 @@
+name: SIH 2026 result watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may delay runs a little)
+  workflow_dispatch:          # lets you press "Run workflow" to test it
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sih-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1.48.0
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install --quiet playwright==1.48.0
+          python -m playwright install --with-deps chromium
+
+      - name: Restore last snapshot
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: sih-state-${{ github.run_id }}
+          restore-keys: sih-state-
+
+      - name: Check SIH website
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCH_URLS: ${{ vars.WATCH_URLS }}
+          ONLY_KEYWORDS: ${{ vars.ONLY_KEYWORDS }}
+        run: python watch.py
+
+      - name: Save snapshot
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: sih-state-${{ github.run_id }}
