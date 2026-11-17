@@ -1,0 +1,46 @@
+name: Reddit SIH result watch
+
+on:
+  schedule:
+    - cron: "5-59/10 * * * *"   # every 10 minutes (offset from the other watcher)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reddit-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore last state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: reddit-state-${{ github.run_id }}
+          restore-keys: reddit-state-
+
+      - name: Check Reddit
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_SUBS: ${{ vars.REDDIT_SUBS }}
+        run: python reddit_watch.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: reddit-state-${{ github.run_id }}
