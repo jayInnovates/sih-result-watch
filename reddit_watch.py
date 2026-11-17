@@ -28,9 +28,9 @@ from pathlib import Path
 
 SUBREDDITS = [
     s.strip()
-    for s in os.environ.get(
-        "REDDIT_SUBS",
-        "Btechtards,developersIndia,Indian_Academia,IndianStudents,SmartIndiaHackathon,NITSilchar",
+    for s in (
+        os.environ.get("REDDIT_SUBS", "").strip()
+        or "Btechtards,developersIndia,Indian_Academia,IndianStudents,SmartIndiaHackathon,NITSilchar"
     ).split(",")
     if s.strip()
 ]
@@ -203,8 +203,8 @@ def fetch_all() -> tuple[list[dict], str, int, int]:
                 ok += 1
             except urllib.error.HTTPError as e:
                 print(f"[reddit:{method}] {e.code} {path[:70]}", file=sys.stderr)
-                if e.code in (401, 403, 429) and ok == 0:
-                    blocked = True
+                if e.code == 429:
+                    blocked = ok == 0
                     break
             except Exception as e:  # noqa: BLE001
                 print(f"[reddit:{method}] error {path[:70]}: {e}", file=sys.stderr)
