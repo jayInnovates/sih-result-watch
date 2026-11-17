@@ -26,14 +26,15 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-SUBREDDITS = [
-    s.strip()
-    for s in (
-        os.environ.get("REDDIT_SUBS", "").strip()
-        or "Btechtards,developersIndia,Indian_Academia,IndianStudents,SmartIndiaHackathon,NITSilchar"
-    ).split(",")
-    if s.strip()
-]
+# Subreddits where SIH results get discussed first. CORE = known to exist;
+# EXTRA are tried too, and dropped automatically if Reddit rejects them.
+CORE_SUBS = ["Btechtards", "developersIndia", "Indian_Academia", "hackathon", "india"]
+EXTRA_SUBS = ["hackathons", "IndianStudents", "SmartIndiaHackathon", "NITSilchar", "StudentsofIndia"]
+_custom = os.environ.get("REDDIT_SUBS", "").strip()
+if _custom:
+    CORE_SUBS, EXTRA_SUBS = [x.strip() for x in _custom.split(",") if x.strip()], []
+SUBREDDITS = CORE_SUBS + EXTRA_SUBS
+FELL_BACK = False
 SEARCH_QUERY = '"SIH 2026" OR "SIH result" OR "SIH results" OR "smart india hackathon"'
 
 SIH = re.compile(r"\bSIH\b|smart\s*india\s*hackathon", re.IGNORECASE)
@@ -120,23 +121,27 @@ def _from_listing(data: dict) -> list[dict]:
 
 
 def _from_rss(raw: bytes, sub: str) -> list[dict]:
+    import calendar
     ns = {"a": "http://www.w3.org/2005/Atom"}
     root = ET.fromstring(raw)
     out = []
     for e in root.findall("a:entry", ns):
         link_el = e.find("a:link", ns)
         link = link_el.get("href") if link_el is not None else ""
+        cat = e.find("a:category", ns)
         content = re.sub(r"<[^>]+>", " ", e.findtext("a:content", "", ns))
+        content = re.sub(r"submitted by\s+/u/\S+.*$", "", content)
         title = e.findtext("a:title", "", ns)
-        upd = e.findtext("a:updated", "", ns) or e.findtext("a:published", "", ns)
+        upd = e.findtext("a:published", "", ns) or e.findtext("a:updated", "", ns)
         try:
-            created = time.mktime(time.strptime(upd[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+            created = calendar.timegm(time.strptime(upd[:19], "%Y-%m-%dT%H:%M:%S"))
         except Exception:  # noqa: BLE001
             created = time.time()
+        is_comment = bool(re.search(r"/comments/[^/]+/[^/]*/[a-z0-9]+/?$", link))
         out.append({
             "id": e.findtext("a:id", "", ns) or link,
-            "kind": "comment" if "/comments/" in link and link.rstrip("/").count("/") > 7 else "post",
-            "sub": sub,
+            "kind": "comment" if is_comment else "post",
+            "sub": (cat.get("term") if cat is not None else sub) or sub,
             "text": re.sub(r"\s+", " ", f"{title} {content}").strip()[:800],
             "link": link,
             "created": created,
@@ -161,58 +166,88 @@ def oauth_token() -> str | None:
     return json.loads(urllib.request.urlopen(req, timeout=25).read())["access_token"]
 
 
-def endpoints() -> list[tuple[str, str]]:
-    eps = []
-    for s in SUBREDDITS:
-        eps.append((s, f"/r/{s}/new"))
-        eps.append((s, f"/r/{s}/comments"))
+def rss_feeds(subs: list[str]) -> list[tuple[str, str]]:
+    multi = "+".join(subs)
+    busy = [x for x in subs if x in ("Btechtards", "developersIndia")]
+    # r/india is far too busy to follow every comment; its posts are still in "posts"
+    rest = [x for x in subs if x not in busy and x != "india"] or subs
     q = urllib.parse.quote(SEARCH_QUERY)
-    eps.append(("search", f"/search?q={q}&sort=new&t=week&type=link"))
-    return eps
+    feeds = [("posts", f"https://www.reddit.com/r/{multi}/new/.rss?limit=100")]
+    # comments: busy subs get their own feed so 100-item window covers 10 minutes
+    for b_ in busy:
+        feeds.append((f"comments:{b_}", f"https://www.reddit.com/r/{b_}/comments/.rss?limit=100"))
+    feeds.append(("comments:other", f"https://www.reddit.com/r/{'+'.join(rest)}/comments/.rss?limit=100"))
+    feeds.append(("search", f"https://www.reddit.com/search.rss?q={q}&sort=new&t=week&limit=100"))
+    return feeds
+
+
+def get_rss(url: str) -> bytes:
+    for attempt in range(3):
+        try:
+            return http_get(url, {"Accept": "application/atom+xml"})
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                wait = 20 * (attempt + 1)
+                print(f"[reddit:rss] 429, waiting {wait}s")
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 def fetch_all() -> tuple[list[dict], str, int, int]:
     """Returns (items, method, ok_count, total)."""
-    eps = endpoints()
-    methods = []
+    # Official API, only if keys exist (Reddit stopped issuing new keys in 2025-26)
     try:
         tok = oauth_token()
-        if tok:
-            methods.append(("api", tok))
     except Exception as e:  # noqa: BLE001
+        tok = None
         print(f"[reddit] OAuth failed: {e}", file=sys.stderr)
-    methods += [("json", None), ("rss", None)]
-
-    for method, tok in methods:
-        items, ok, blocked = [], 0, False
-        for sub, path in eps:
-            sep = "&" if "?" in path else "?"
+    if tok:
+        items, ok = [], 0
+        multi = "+".join(SUBREDDITS)
+        paths = [f"/r/{multi}/new", f"/r/{multi}/comments",
+                 f"/search?q={urllib.parse.quote(SEARCH_QUERY)}&sort=new&t=week"]
+        for pth in paths:
+            sep = "&" if "?" in pth else "?"
             try:
-                if method == "api":
-                    raw = http_get(f"https://oauth.reddit.com{path}{sep}limit=100&raw_json=1",
-                                   {"Authorization": f"bearer {tok}"})
-                    items += _from_listing(json.loads(raw))
-                elif method == "json":
-                    base, _, qs = path.partition("?")
-                    raw = http_get(f"https://www.reddit.com{base}.json?{qs}{'&' if qs else ''}limit=100&raw_json=1")
-                    items += _from_listing(json.loads(raw))
-                else:
-                    base, _, qs = path.partition("?")
-                    raw = http_get(f"https://www.reddit.com{base}/.rss?{qs}{'&' if qs else ''}limit=100")
-                    items += _from_rss(raw, sub)
+                raw = http_get(f"https://oauth.reddit.com{pth}{sep}limit=100&raw_json=1",
+                               {"Authorization": f"bearer {tok}"})
+                items += _from_listing(json.loads(raw))
                 ok += 1
-            except urllib.error.HTTPError as e:
-                print(f"[reddit:{method}] {e.code} {path[:70]}", file=sys.stderr)
-                if e.code == 429:
-                    blocked = ok == 0
-                    break
             except Exception as e:  # noqa: BLE001
-                print(f"[reddit:{method}] error {path[:70]}: {e}", file=sys.stderr)
-            time.sleep(1.0 if method == "api" else 2.5)
-        print(f"[reddit:{method}] {ok}/{len(eps)} endpoints OK, {len(items)} items")
-        if ok and not blocked:
-            return items, method, ok, len(eps)
-    return [], "none", 0, len(eps)
+                print(f"[reddit:api] {pth[:60]}: {e}", file=sys.stderr)
+        if ok:
+            return items, "api", ok, len(paths)
+
+    # Public RSS (works from GitHub, but rate-limited -> few combined requests)
+    subs = list(SUBREDDITS)
+    feeds = rss_feeds(subs)
+    items, ok = [], 0
+    i = 0
+    while i < len(feeds):
+        name, url = feeds[i]
+        try:
+            got = _from_rss(get_rss(url), name)
+            items += got
+            ok += 1
+            print(f"[reddit:rss] {name}: {len(got)} items")
+        except urllib.error.HTTPError as e:
+            print(f"[reddit:rss] {e.code} {name}", file=sys.stderr)
+            # a missing/private/banned sub breaks a combined feed -> retry with CORE only
+            if e.code in (403, 404) and set(subs) != set(CORE_SUBS) and name in ("posts", "comments:other"):
+                global FELL_BACK
+                FELL_BACK = True
+                subs = list(CORE_SUBS)
+                feeds = feeds[:i] + [f for f in rss_feeds(subs) if f[0] == name] + feeds[i + 1:]
+                print(f"[reddit:rss] retrying {name} with core subs only")
+                continue
+        except Exception as e:  # noqa: BLE001
+            print(f"[reddit:rss] error {name}: {e}", file=sys.stderr)
+        i += 1
+        time.sleep(8)
+    print(f"[reddit:rss] {ok}/{len(feeds)} feeds OK, {len(items)} items")
+    return (items, "rss", ok, len(feeds)) if ok else ([], "none", 0, len(feeds))
 
 
 # --------------------------------------------------------------------------- #
@@ -230,19 +265,25 @@ def is_hit(it: dict) -> bool:
 def main() -> int:
     STATE_DIR.mkdir(exist_ok=True)
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    first = "since" not in state
+    first = not state.get("announced")
     since = state.setdefault("since", time.time())
     alerted = set(state.get("alerted", []))
 
+    global SUBREDDITS
+    if state.get("core_only"):
+        SUBREDDITS = list(CORE_SUBS)
     items, method, ok, total = fetch_all()
+    if FELL_BACK:
+        state["core_only"] = True
+        SUBREDDITS = list(CORE_SUBS)
 
     if method == "none":
         state["fail"] = state.get("fail", 0) + 1
-        if first or state["fail"] == FAIL_ALERT_AFTER:
+        if state["fail"] == FAIL_ALERT_AFTER:
             notify(
                 "Reddit watcher: Reddit is blocking GitHub",
-                "Reddit refused all requests from GitHub's servers. Fix: add free Reddit API "
-                "keys (REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET repo secrets).",
+                "Reddit refused every request from GitHub's servers for ~1 hour "
+                "(rate limit or block). The watcher keeps trying every 10 minutes.",
             )
         STATE_FILE.write_text(json.dumps(state))
         return 0
@@ -282,10 +323,11 @@ def main() -> int:
         print(f"[reddit] no new SIH-result mentions ({len(items)} items scanned via {method})")
 
     if first:
+        state["announced"] = True
         notify(
             "Reddit watcher is running ✅",
             f"Scanning new posts + comments in r/{', r/'.join(SUBREDDITS)} and a Reddit-wide "
-            f"search every ~10 min.\nAccess: {method} ({ok}/{total} feeds OK, {len(items)} items).",
+            f"search every ~10 min.\nThis run: {ok}/{total} feeds OK, {len(items)} items.",
             click="https://www.reddit.com/r/Btechtards/new/",
         )
 

@@ -12,6 +12,10 @@ Runs every ~10 minutes on GitHub Actions (free for public repos) and sends a pus
 - Stop: Actions → *SIH 2026 result watch* → ⋯ → **Disable workflow**
 
 ## Reddit watcher (`reddit_watch.py`, workflow *Reddit SIH result watch*)
-Every ~10 minutes scans **new posts and new comments** in r/Btechtards, r/developersIndia, r/Indian_Academia, r/IndianStudents, r/SmartIndiaHackathon, r/NITSilchar plus a Reddit-wide search, and sends an **urgent** ntfy alert when someone says SIH results are out / shortlisted / selected / finale (English + Hinglish). "When will results come?" questions are ignored.
+Every ~10 minutes reads Reddit's public **RSS** feeds (the JSON feed returns 403 to GitHub, and Reddit no longer issues new free API keys):
+- new posts in r/Btechtards, r/developersIndia, r/Indian_Academia, r/hackathon, r/india (+ r/hackathons, r/IndianStudents, r/SmartIndiaHackathon, r/NITSilchar, r/StudentsofIndia if they exist)
+- new **comments** in those subreddits (except r/india)
+- a Reddit-wide search for "SIH 2026" / "SIH result" / "Smart India Hackathon"
+
+Sends an **urgent** ntfy alert when someone says SIH results are out / shortlisted / selected / finale (English + Hinglish). "When will results come?" questions are ignored.
 - Change subreddits: repo variable `REDDIT_SUBS` (comma-separated)
-- If Reddit blocks GitHub's servers, add free API keys from reddit.com/prefs/apps as secrets `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET`
