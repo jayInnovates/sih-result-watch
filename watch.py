@@ -1,50 +1,69 @@
 #!/usr/bin/env python3
 """
-SIH 2026 result watcher.
+SIH 2026 result watcher  (runs every ~10 min on GitHub Actions, free)
 
-Loads the SIH website in a real (headless) browser, compares it with the
-previous check, and sends a push notification when something new appears.
-Notifications that mention results / shortlist / finale are sent as URGENT.
+Two sources, checked on every run:
 
-Runs every 10 minutes on GitHub Actions (see .github/workflows/watch.yml).
+1. NEWS  - Google News + Bing News searches for "Smart India Hackathon 2026".
+           When results come out, colleges and news sites post
+           "team selected for SIH 2026 Grand Finale" within hours. New articles
+           that mention result / shortlist / finale trigger an URGENT alert.
 
-Settings (GitHub repo -> Settings -> Secrets and variables -> Actions):
-  NTFY_TOPIC         (secret)  your private ntfy topic name, e.g. sih-jay-8f3k2q9x
-  TELEGRAM_BOT_TOKEN (secret)  optional, if you also want Telegram messages
-  TELEGRAM_CHAT_ID   (secret)  optional, used with TELEGRAM_BOT_TOKEN
-  WATCH_URLS         (variable) optional, comma-separated pages to watch
-                               (default: https://sih.gov.in/)
-  ONLY_KEYWORDS      (variable) optional, "true" = only notify when the new text
-                               mentions result/shortlist/finale etc.
+2. SITE  - https://sih.gov.in rendered in a headless browser. NOTE: the site's
+           firewall currently answers GitHub's (overseas) servers with
+           "403 Forbidden", so this part only works if they ever unblock it.
+           Blocked responses are detected and never treated as a change.
+
+Alerts go to ntfy (repo secret NTFY_TOPIC) and optionally Telegram
+(secrets TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID).
+
+Optional repo variables:
+  WATCH_URLS     comma-separated pages to watch (default https://sih.gov.in/)
+  ONLY_KEYWORDS  "true" = for the SITE, only alert when new text mentions results
 """
 
+import email.utils
 import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
-
-WATCH_URLS = [
-    u.strip()
-    for u in os.environ.get("WATCH_URLS", "").split(",")
-    if u.strip()
-] or ["https://sih.gov.in/"]
-
+WATCH_URLS = [u.strip() for u in os.environ.get("WATCH_URLS", "").split(",") if u.strip()] or [
+    "https://sih.gov.in/"
+]
 ONLY_KEYWORDS = os.environ.get("ONLY_KEYWORDS", "false").strip().lower() == "true"
 
-KEYWORDS = re.compile(
-    r"result|shortlist|short-list|selected|qualified|grand\s*finale|"
-    r"phase[\s\-]*(1|i)\b|screening|nodal\s*cent|finalist",
+NEWS_FEEDS = [
+    "https://news.google.com/rss/search?q=%22Smart+India+Hackathon+2026%22&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=%22SIH+2026%22+result+OR+shortlisted+OR+%22grand+finale%22&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=%22Smart+India+Hackathon%22+2026+%22grand+finale%22&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://www.bing.com/news/search?q=%22Smart+India+Hackathon+2026%22&format=rss",
+]
+
+RESULT_WORDS = re.compile(
+    r"result|shortlist|short-list|selected|qualif|grand\s*finale|finalist|declared|"
+    r"announced|phase[\s\-]*(1|i)\b|screening|nodal\s*cent",
+    re.IGNORECASE,
+)
+SIH_WORDS = re.compile(r"\bSIH\b|smart\s+india\s+hackathon", re.IGNORECASE)
+# College-level rounds also use "shortlisted" - ignore those.
+NOISE_WORDS = re.compile(r"internal|pre-?\s?qualifier|ideathon|in-house|campus\s+round", re.IGNORECASE)
+NEWS_MAX_AGE_DAYS = 4
+
+BLOCKED = re.compile(
+    r"^\s*(40[0-9]|429|5\d\d)\b|forbidden|access denied|request blocked|"
+    r"application-gateway|captcha|are you a robot",
     re.IGNORECASE,
 )
 
 STATE_DIR = Path("state")
 STATE_FILE = STATE_DIR / "state.json"
-FAIL_ALERT_AFTER = 6  # consecutive failed checks (= 1 hour) before warning you
+FAIL_ALERT_AFTER = 6  # consecutive failed news checks (= ~1 hour) before warning
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -57,7 +76,6 @@ USER_AGENT = (
 # --------------------------------------------------------------------------- #
 def notify(title: str, body: str, urgent: bool = False, click: str = "") -> None:
     sent = False
-
     topic = os.environ.get("NTFY_TOPIC", "").strip()
     if topic:
         headers = {
@@ -83,9 +101,7 @@ def notify(title: str, body: str, urgent: bool = False, click: str = "") -> None
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if tg_token and tg_chat:
-        text = f"{'🚨 ' if urgent else ''}{title}\n\n{body}"
-        if click:
-            text += f"\n\n{click}"
+        text = f"{'🚨 ' if urgent else ''}{title}\n\n{body}" + (f"\n\n{click}" if click else "")
         data = urllib.parse.urlencode(
             {"chat_id": tg_chat, "text": text[:4000], "disable_web_page_preview": "true"}
         ).encode()
@@ -103,55 +119,149 @@ def notify(title: str, body: str, urgent: bool = False, click: str = "") -> None
 
 
 # --------------------------------------------------------------------------- #
-# Page capture
+# 1. News feeds
+# --------------------------------------------------------------------------- #
+def fetch_feed(url: str) -> list[dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    raw = urllib.request.urlopen(req, timeout=30).read()
+    root = ET.fromstring(raw)
+    items = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        desc = re.sub(r"<[^>]+>", " ", it.findtext("description") or "")
+        src = (it.findtext("source") or "").strip()
+        pub = None
+        try:
+            pub = email.utils.parsedate_to_datetime(it.findtext("pubDate") or "").timestamp()
+        except Exception:  # noqa: BLE001
+            pass
+        if title:
+            items.append({"title": title, "link": link, "desc": desc, "source": src, "pub": pub})
+    return items
+
+
+def news_key(item: dict) -> str:
+    # Google appends " - Source" to titles; strip it so the same story dedupes across feeds
+    t = re.sub(r"\s+-\s+[^-]{2,60}$", "", item["title"])
+    return re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
+
+
+def is_result_news(item: dict) -> bool:
+    text = f"{item['title']} {item['desc']}"
+    if not SIH_WORDS.search(text) or not RESULT_WORDS.search(item["title"] + " " + item["desc"][:300]):
+        return False
+    if NOISE_WORDS.search(item["title"]):
+        return False
+    # Skip old editions unless 2026 is also mentioned
+    if re.search(r"20(2[0-5])", text) and "2026" not in text:
+        return False
+    if item["pub"] and time.time() - item["pub"] > NEWS_MAX_AGE_DAYS * 86400:
+        return False
+    return True
+
+
+def check_news(state: dict) -> str:
+    seen = state.get("news_seen")
+    baseline = seen is None
+    seen = set(seen or [])
+
+    items, ok = [], 0
+    for url in NEWS_FEEDS:
+        try:
+            got = fetch_feed(url)
+            items += got
+            ok += 1
+            print(f"[news] {len(got):3d} items  {url[:90]}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[news] FAILED {url[:90]}: {e}", file=sys.stderr)
+
+    if ok == 0:
+        state["news_fail"] = state.get("news_fail", 0) + 1
+        if state["news_fail"] == FAIL_ALERT_AFTER:
+            notify(
+                "SIH watcher: news feeds unreachable",
+                "Google/Bing News could not be reached for ~1 hour. The watcher keeps trying.",
+            )
+        return "news feeds unreachable"
+    state["news_fail"] = 0
+
+    fresh = []
+    for it in items:
+        k = news_key(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        if not baseline and is_result_news(it):
+            fresh.append(it)
+
+    state["news_seen"] = list(seen)[-3000:]
+
+    if fresh:
+        lines = [
+            f"• {it['title'][:150]}" + (f"  ({it['source']})" if it["source"] and it["source"] not in it["title"] else "")
+            for it in fresh[:6]
+        ]
+        notify(
+            "🚨 SIH 2026: result news spotted!",
+            "New articles about SIH 2026 results / finale:\n"
+            + "\n".join(lines)
+            + "\n\nVerify on sih.gov.in and with your college SPOC.",
+            urgent=True,
+            click=fresh[0]["link"] or "https://sih.gov.in/",
+        )
+    else:
+        print("[news] nothing new about results")
+    return f"news OK ({len(items)} articles from {ok}/{len(NEWS_FEEDS)} feeds)"
+
+
+# --------------------------------------------------------------------------- #
+# 2. SIH website (headless browser)
 # --------------------------------------------------------------------------- #
 def normalise(s: str) -> str:
-    """Collapse whitespace and mask digits so counters/clocks don't trigger alerts."""
     s = re.sub(r"\s+", " ", s).strip()
-    return re.sub(r"\d+", "#", s)
+    return re.sub(r"\d+", "#", s)  # mask counters/clocks
 
 
 def capture(page, url: str) -> dict:
     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     try:
         page.wait_for_load_state("networkidle", timeout=20_000)
-    except Exception:  # noqa: BLE001  (busy pages may never go fully idle)
+    except Exception:  # noqa: BLE001
         pass
     page.wait_for_timeout(3_000)
 
+    title = page.title()
     text = page.inner_text("body")
-    print(f"[capture] {url} -> title={page.title()!r}, {len(text)} chars")
-    print("[capture] first 400 chars: " + text[:400].replace("\n", " / "))
-    links = page.eval_on_selector_all(
-        "a[href]",
-        "els => els.map(e => [(e.innerText || e.title || '').trim(), e.href])",
-    )
+    print(f"[site] {url} -> title={title!r}, {len(text)} chars")
+    if len(text) < 2000 and (BLOCKED.search(title) or BLOCKED.search(text[:300])):
+        raise RuntimeError(f"blocked by site firewall ({title or text[:60]!r})")
 
+    links = page.eval_on_selector_all(
+        "a[href]", "els => els.map(e => [(e.innerText || e.title || '').trim(), e.href])"
+    )
     lines = {}
     for raw in text.splitlines():
         raw = re.sub(r"\s+", " ", raw).strip()
         if len(raw) >= 3:
             lines.setdefault(normalise(raw), raw)
-
     link_map = {}
     for label, href in links:
         label = re.sub(r"\s+", " ", label or "").strip()
-        if not href or href.startswith("javascript"):
-            continue
-        link_map.setdefault(normalise(f"{label} | {href}"), [label, href])
-
+        if href and not href.startswith("javascript"):
+            link_map.setdefault(normalise(f"{label} | {href}"), [label, href])
+    if not lines:
+        raise RuntimeError("page loaded but had no text")
     return {"lines": lines, "links": link_map}
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def main() -> int:
-    STATE_DIR.mkdir(exist_ok=True)
-    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    pages = state.setdefault("pages", {})
-    first_run = not pages
+def check_site(state: dict) -> str:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "site check skipped (playwright missing)"
 
+    pages = state.setdefault("pages_v2", {})
     snapshots, errors = {}, []
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -160,75 +270,65 @@ def main() -> int:
         for url in WATCH_URLS:
             try:
                 snapshots[url] = capture(page, url)
-                if not snapshots[url]["lines"]:
-                    raise RuntimeError("page loaded but had no text")
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{url}: {e}")
+                print(f"[site] FAILED {url}: {e}", file=sys.stderr)
         browser.close()
 
-    # ---- failures: warn once after an hour of consecutive failures -------- #
-    if errors and not snapshots:
-        state["fail_count"] = state.get("fail_count", 0) + 1
-        print("Check failed:\n" + "\n".join(errors), file=sys.stderr)
-        if state["fail_count"] == FAIL_ALERT_AFTER:
-            notify(
-                "SIH watcher: site unreachable for 1 hour",
-                "Could not load the SIH website for the last 6 checks. "
-                "It may be down or blocking GitHub. The watcher keeps trying.\n\n"
-                + "\n".join(errors)[:500],
-            )
-        STATE_FILE.write_text(json.dumps(state))
-        return 0
-    if state.get("fail_count", 0) >= FAIL_ALERT_AFTER:
-        notify("SIH watcher: site reachable again", "Checks are working normally again.")
-    state["fail_count"] = 0
-
-    # ---- compare with previous snapshot ----------------------------------- #
     for url, snap in snapshots.items():
         prev = pages.get(url)
         pages[url] = snap
         if prev is None:
+            print(f"[site] baseline saved for {url}")
             continue
-
         new_lines = [snap["lines"][k] for k in snap["lines"] if k not in prev["lines"]]
         new_links = [snap["links"][k] for k in snap["links"] if k not in prev["links"]]
         if not new_lines and not new_links:
-            print(f"No change: {url}")
+            print(f"[site] no change: {url}")
             continue
-
-        hot_lines = [l for l in new_lines if KEYWORDS.search(l)]
-        hot_links = [l for l in new_links if KEYWORDS.search(f"{l[0]} {l[1]}")]
+        hot_lines = [l for l in new_lines if RESULT_WORDS.search(l)]
+        hot_links = [l for l in new_links if RESULT_WORDS.search(f"{l[0]} {l[1]}")]
         urgent = bool(hot_lines or hot_links)
-
         if ONLY_KEYWORDS and not urgent:
-            print(f"Changed (no keywords, suppressed): {url}")
+            print(f"[site] changed (no keywords, suppressed): {url}")
             continue
-
-        show_lines = (hot_lines or new_lines)[:8]
-        show_links = (hot_links or new_links)[:5]
         body = []
-        if show_lines:
-            body.append("New text:\n" + "\n".join(f"• {l[:160]}" for l in show_lines))
-        if show_links:
-            body.append("New links:\n" + "\n".join(f"• {t or '(link)'} → {h}" for t, h in show_links))
-
-        click = show_links[0][1] if (urgent and show_links) else url
-        title = (
-            "🚨 SIH 2026: possible RESULT update!" if urgent else "SIH website changed"
-        )
-        notify(title, "\n\n".join(body) or "The page changed.", urgent=urgent, click=click)
-
-    if first_run:
-        n = sum(len(s["lines"]) for s in snapshots.values())
+        if hot_lines or new_lines:
+            body.append("New text:\n" + "\n".join(f"• {l[:160]}" for l in (hot_lines or new_lines)[:8]))
+        if hot_links or new_links:
+            body.append("New links:\n" + "\n".join(f"• {t or '(link)'} → {h}" for t, h in (hot_links or new_links)[:5]))
+        click = (hot_links[0][1] if hot_links else url)
         notify(
-            "SIH watcher is running ✅",
-            f"Baseline saved ({n} lines of text). You'll be notified when the "
-            f"SIH website changes. Checking every ~10 minutes.",
-            click=WATCH_URLS[0],
+            "🚨 SIH 2026: possible RESULT update on sih.gov.in!" if urgent else "sih.gov.in changed",
+            "\n\n".join(body) or "The page changed.",
+            urgent=urgent,
+            click=click,
         )
 
-    if errors:
-        print("Some pages failed:\n" + "\n".join(errors), file=sys.stderr)
+    if snapshots and not errors:
+        return "site OK"
+    if snapshots:
+        return "site partly reachable"
+    return "site blocked/unreachable from GitHub (expected)"
+
+
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    STATE_DIR.mkdir(exist_ok=True)
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    first_v2 = "news_seen" not in state
+
+    news_status = check_news(state)
+    site_status = check_site(state)
+    print(f"[summary] {news_status} | {site_status}")
+
+    if first_v2:
+        notify(
+            "SIH watcher updated ✅",
+            f"Now checking every ~10 min:\n• {news_status}\n• {site_status}\n\n"
+            "You'll get an URGENT alert when SIH 2026 result / grand-finale news appears.",
+            click="https://sih.gov.in/",
+        )
 
     STATE_FILE.write_text(json.dumps(state))
     return 0
