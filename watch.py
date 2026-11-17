@@ -120,6 +120,8 @@ def capture(page, url: str) -> dict:
     page.wait_for_timeout(3_000)
 
     text = page.inner_text("body")
+    print(f"[capture] {url} -> title={page.title()!r}, {len(text)} chars")
+    print("[capture] first 400 chars: " + text[:400].replace("\n", " / "))
     links = page.eval_on_selector_all(
         "a[href]",
         "els => els.map(e => [(e.innerText || e.title || '').trim(), e.href])",
